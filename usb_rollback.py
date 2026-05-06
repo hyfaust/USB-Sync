@@ -321,7 +321,7 @@ def restore_source(source_root: Path) -> None:
         print(f"source has no backup directory: {source_root}")
         return
 
-    temp_group = usb_sync.SyncGroup("", [], Path("."), None, None, [])
+    temp_group = usb_sync.SyncGroup("", [], Path("."), None, None, 0, [])
     entries = gather_source_backups(temp_group, source_root)
     if not entries:
         print(f"source has no backup files: {source_root}")

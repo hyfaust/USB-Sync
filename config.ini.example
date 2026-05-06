@@ -2,8 +2,8 @@
 ; Log files are stored in this directory as sync_<target>.log
 log_file_dir = ./logs
 ; Default rules: use * to ignore everything, then ! to re-include files.
-ignore = *
 backup_limit = 5
+log_max_bytes = 1048576
 
 [docs]
 sources = ./dira, ./dirb
@@ -14,3 +14,4 @@ ignore = *,!readme.txt
 sources = ./code_a, ./code_b
 target = ./target_code
 backup_limit = 10
+log_max_bytes = 2097152
