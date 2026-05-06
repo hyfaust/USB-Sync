@@ -6,6 +6,7 @@ It consists of two scripts:
 
 - `usb_sync.py` — synchronizes folders and commits target changes into Git
 - `usb_rollback.py` — lists backup points and restores previous versions
+- `gen_section.py` / `gen_section.pl` / `gen_section.awk` — generate a sync section from a path list
 
 ## Features
 
@@ -111,3 +112,8 @@ Source rollback restores files from the latest available backup for each file.
 - Target-side backup folders are disabled
 - Target history is expected to be recovered through Git
 - The scripts are designed for local/offline USB workflows
+
+## Section Generator
+
+The generator scripts read a text file where each line is either a full path or a plain file name.
+They deduplicate entries, infer the common parent folder from the first absolute path, and output one sync section ready to paste into `config.ini`.
