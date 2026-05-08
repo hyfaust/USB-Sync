@@ -101,18 +101,29 @@ python usb_rollback.py restore --config path/to/config.ini
 - Git commits for each target
 - Source backup files with human-readable timestamps
 
+Use `--scope` to narrow the output:
+
+```bash
+python usb_rollback.py list --scope target
+python usb_rollback.py list --scope source
+python usb_rollback.py list --scope source.1
+python usb_rollback.py list --scope docs.source.1
+```
+
 ### Restore
 
 `restore` supports:
 
-- all groups
-- one group
-- only targets
-- only sources
-- one specific source
+- `--scope target` / `--scope target.1` for all targets
+- `--scope source` for all sources
+- `--scope source.1` for the first source in each section
+- `--scope docs.source.1` for one section
+- `--to <id>` for a specific rollback point from `list`
+- For targets, `--to` also accepts full or short commit hashes
 
 Target rollback uses Git and moves back one commit at a time.
-Source rollback restores files from the latest available backup for each file.
+Source rollback restores files from the latest available backup for each file, or a specific backup when `--to` is provided.
+Target restore prompts for confirmation before running `git reset --hard`.
 
 ## Output Files
 

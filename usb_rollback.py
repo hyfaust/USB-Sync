@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,7 @@ class SourceBackupEntry:
     backup_root: Path
     original_path: Path
     backup_file: Path
+    rollback_id: str
     timestamp: datetime
     size: int
 
@@ -36,10 +38,27 @@ class SourceBackupEntry:
 @dataclass(frozen=True)
 class TargetCommitEntry:
     target_root: Path
+    rollback_id: str
+    timestamp: datetime
     commit_hash: str
     short_hash: str
     timestamp_text: str
     subject: str
+
+
+@dataclass(frozen=True)
+class RollbackSelector:
+    section_name: Optional[str]
+    endpoint_kind: str
+    source_index: Optional[int]
+
+
+@dataclass(frozen=True)
+class GroupScope:
+    include_target: bool
+    source_roots: List[Path]
+    has_target_selector: bool
+    has_source_selector: bool
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,26 +73,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_scope_arguments(command_parser: argparse.ArgumentParser) -> None:
         command_parser.add_argument(
-            "--group",
+            "--scope",
             action="append",
             default=None,
-            help="Sync group name to scope to. Repeatable.",
+            help="Select target, target.1, source, source.N, or section-scoped forms like docs.source.1.",
         )
         command_parser.add_argument(
-            "--targets-only",
-            action="store_true",
-            help="Operate only on target folders.",
-        )
-        command_parser.add_argument(
-            "--sources-only",
-            action="store_true",
-            help="Operate only on source folders.",
-        )
-        command_parser.add_argument(
-            "--source",
-            action="append",
+            "--to",
             default=None,
-            help="Specific source folder path to scope to. Repeatable.",
+            help="Rollback identifier from list output, or a commit hash for targets.",
         )
 
     add_scope_arguments(subparsers.add_parser("list", parents=[common], help="List rollback points"))
@@ -116,45 +124,95 @@ def resolve_relative_input(raw_value: str, config_path: Path) -> Path:
     return usb_sync.resolve_relative_path(raw_value, script_dir=script_dir, cwd=cwd, config_dir=config_dir)
 
 
-def select_sources(
-    group: usb_sync.SyncGroup,
-    config_path: Path,
-    raw_sources: Optional[Sequence[str]],
-) -> List[Path]:
-    if not raw_sources:
-        return list(group.sources)
+def parse_scope_selector(raw: str) -> RollbackSelector:
+    text = raw.strip()
+    if not text:
+        raise ValueError("Scope selector cannot be empty.")
 
-    configured = {source.resolve(strict=False): source for source in group.sources}
-    selected: List[Path] = []
-    missing: List[str] = []
-    for raw in raw_sources:
-        candidate = resolve_relative_input(raw, config_path).resolve(strict=False)
-        source = configured.get(candidate)
-        if source is None:
-            missing.append(raw)
-            continue
-        if source not in selected:
-            selected.append(source)
-
-    if missing:
+    match = re.fullmatch(r"(?:(?P<section>.+)\.)?(?P<kind>target|source)(?:\.(?P<index>\d+))?", text)
+    if not match:
         raise ValueError(
-            f"Source path(s) not found in group [{group.name}]: {', '.join(missing)}"
+            "The --scope selector must be one of: target, target.1, source, source.1, source.N, section.target, "
+            "section.source, or section.source.N."
         )
+
+    section_name = match.group("section")
+    endpoint_kind = match.group("kind")
+    index_text = match.group("index")
+
+    if endpoint_kind == "target":
+        if index_text not in (None, "1"):
+            raise ValueError("The target selector only supports target or target.1.")
+        return RollbackSelector(section_name=section_name, endpoint_kind="target", source_index=None)
+
+    source_index = None if index_text is None else int(index_text)
+    if source_index is not None and source_index <= 0:
+        raise ValueError("The source selector index must be greater than 0.")
+    return RollbackSelector(section_name=section_name, endpoint_kind="source", source_index=source_index)
+
+
+def select_groups(settings: usb_sync.Settings, scopes: Optional[Sequence[str]]) -> List[usb_sync.SyncGroup]:
+    if not scopes:
+        return list(settings.groups)
+
+    selectors = [parse_scope_selector(scope) for scope in scopes]
+    selected: List[usb_sync.SyncGroup] = []
+    for group in settings.groups:
+        if any(selector.section_name is None or selector.section_name == group.name for selector in selectors):
+            selected.append(group)
     return selected
 
 
-def selected_endpoint_mode(args: argparse.Namespace) -> str:
-    if args.targets_only and args.sources_only:
-        raise ValueError("--targets-only and --sources-only cannot be used together.")
-    if args.targets_only and args.source:
-        raise ValueError("--targets-only cannot be combined with --source.")
-    if args.targets_only:
-        return "targets"
-    if args.sources_only:
-        return "sources"
-    if args.source:
-        return "sources"
-    return "both"
+def resolve_source_roots(group: usb_sync.SyncGroup, selector: RollbackSelector) -> List[Path]:
+    existing_sources = [source for source in group.sources if source.exists()]
+    if selector.source_index is None:
+        return existing_sources
+
+    for candidate_index in range(selector.source_index, 0, -1):
+        if candidate_index > len(group.sources):
+            continue
+        source_root = group.sources[candidate_index - 1]
+        if source_root.exists():
+            if candidate_index != selector.source_index:
+                print(
+                    f"[{group.name}] source.{selector.source_index} fell back to source.{candidate_index}: {source_root}"
+                )
+            return [source_root]
+
+    raise ValueError(
+        f"[{group.name}] source.{selector.source_index} is unavailable and no earlier source exists."
+    )
+
+
+def resolve_group_scope(group: usb_sync.SyncGroup, raw_scopes: Optional[Sequence[str]]) -> GroupScope:
+    if not raw_scopes:
+        return GroupScope(True, [source for source in group.sources if source.exists()], True, True)
+
+    selectors = [parse_scope_selector(scope) for scope in raw_scopes]
+    relevant = [selector for selector in selectors if selector.section_name is None or selector.section_name == group.name]
+    if not relevant:
+        return GroupScope(False, [], False, False)
+
+    include_target = False
+    target_selected = False
+    source_roots: List[Path] = []
+    source_selected = False
+    for selector in relevant:
+        if selector.endpoint_kind == "target":
+            include_target = True
+            target_selected = True
+            continue
+        source_selected = True
+        try:
+            source_roots.extend(resolve_source_roots(group, selector))
+        except ValueError as exc:
+            print(str(exc))
+
+    unique_sources: List[Path] = []
+    for source_root in source_roots:
+        if source_root not in unique_sources:
+            unique_sources.append(source_root)
+    return GroupScope(include_target, unique_sources, target_selected, source_selected)
 
 
 def parse_backup_timestamp(path: Path) -> datetime:
@@ -162,6 +220,15 @@ def parse_backup_timestamp(path: Path) -> datetime:
     if match is None:
         raise ValueError(f"Invalid backup file name: {path.name}")
     return datetime.strptime(match.group("ts"), "%Y%m%dT%H%M%S%f")
+
+
+def format_backup_rollback_id(timestamp: datetime) -> str:
+    return timestamp.strftime("%Y%m%dT%H%M%S%f")
+
+
+def format_commit_rollback_id(timestamp: datetime) -> str:
+    normalized = timestamp.replace(microsecond=0)
+    return normalized.strftime("%Y%m%dT%H%M%S%f")
 
 
 def parse_backup_original_path(path: Path) -> Path:
@@ -196,6 +263,7 @@ def gather_source_backups(group: usb_sync.SyncGroup, source_root: Path) -> List[
                 backup_root=backup_root,
                 original_path=original_rel,
                 backup_file=backup_file,
+                rollback_id=format_backup_rollback_id(timestamp),
                 timestamp=timestamp,
                 size=backup_file.stat().st_size,
             )
@@ -241,9 +309,12 @@ def list_target_history(target_root: Path) -> List[TargetCommitEntry]:
         parts = line.split("\x1f")
         if len(parts) != 4:
             continue
+        timestamp = datetime.strptime(parts[2], "%Y-%m-%d %H:%M:%S")
         entries.append(
             TargetCommitEntry(
                 target_root=target_root,
+                rollback_id=format_commit_rollback_id(timestamp),
+                timestamp=timestamp,
                 commit_hash=parts[0],
                 short_hash=parts[1],
                 timestamp_text=parts[2],
@@ -258,14 +329,17 @@ def print_group_header(group: usb_sync.SyncGroup) -> None:
     print(f"  target: {group.target}")
 
 
-def print_target_list(group: usb_sync.SyncGroup) -> None:
+def print_target_list(group: usb_sync.SyncGroup, detailed: bool) -> None:
     history = list_target_history(group.target)
     print("  target commits:")
     if not history:
         print("    (none)")
         return
     for entry in history:
-        print(f"    {entry.timestamp_text} | {entry.short_hash} | {entry.subject}")
+        if detailed:
+            print(f"    {entry.rollback_id} | {entry.timestamp_text} | {entry.short_hash} | {entry.commit_hash} | {entry.subject}")
+        else:
+            print(f"    {entry.rollback_id} | {entry.short_hash} | {entry.subject}")
 
 
 def print_source_list(group: usb_sync.SyncGroup, source_root: Path) -> None:
@@ -279,43 +353,102 @@ def print_source_list(group: usb_sync.SyncGroup, source_root: Path) -> None:
     for entry in entries:
         marker = "*" if latest.get(entry.original_path.as_posix()) == entry else " "
         print(
-            f"    {marker} {entry.timestamp.strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"    {marker} {entry.rollback_id} | {entry.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')} | "
             f"{entry.original_path.as_posix()} | {entry.backup_file.name}"
         )
 
 
 def list_backups(settings: usb_sync.Settings, args: argparse.Namespace) -> None:
-    groups = select_groups(settings, args.group)
-    endpoint_mode = selected_endpoint_mode(args)
-
+    groups = select_groups(settings, args.scope)
     for group in groups:
-        print_group_header(group)
-        if endpoint_mode in {"both", "targets"}:
-            print_target_list(group)
-        if endpoint_mode in {"both", "sources"}:
-            sources = select_sources(group, settings.config_path, args.source)
-            for source_root in sources:
+        try:
+            scope = resolve_group_scope(group, args.scope)
+            print_group_header(group)
+            if scope.include_target:
+                print_target_list(group, detailed=not scope.has_source_selector)
+            for source_root in scope.source_roots:
                 print_source_list(group, source_root)
+        except ValueError as exc:
+            print(str(exc))
 
 
-def restore_target(group: usb_sync.SyncGroup) -> None:
+def resolve_target_revision(history: Sequence[TargetCommitEntry], to_value: Optional[str]) -> Optional[TargetCommitEntry]:
+    if not history:
+        return None
+
+    if to_value is None:
+        return history[1] if len(history) > 1 else None
+
+    normalized = to_value.strip()
+    for entry in history:
+        if normalized in {entry.rollback_id, entry.commit_hash, entry.short_hash, entry.timestamp_text}:
+            return entry
+        if entry.commit_hash.startswith(normalized):
+            return entry
+    return None
+
+
+def prompt_target_restore(group: usb_sync.SyncGroup, entry: Optional[TargetCommitEntry]) -> bool:
+    if sys.stdin is not None and not sys.stdin.isatty():
+        raise RuntimeError(f"Target restore for [{group.name}] requires an interactive terminal.")
+
+    if entry is None:
+        prompt = f"[{group.name}] reset target to the previous commit? [y/N]: "
+    else:
+        prompt = f"[{group.name}] reset target to {entry.rollback_id} ({entry.short_hash} | {entry.subject})? [y/N]: "
+
+    response = input(prompt).strip().lower()
+    return response in {"y", "yes"}
+
+
+def restore_target(group: usb_sync.SyncGroup, to_value: Optional[str]) -> None:
     target = group.target
     usb_sync.ensure_git_safe_directory(target)
     if not (target / ".git").exists():
         print(f"[{group.name}] target has no Git repository: {target}")
         return
 
-    parent_check = usb_sync.run_command(["git", "-C", str(target), "rev-parse", "--verify", "HEAD~1"], check=False)
-    if parent_check.returncode != 0:
-        print(f"[{group.name}] target has no previous commit: {target}")
+    history = list_target_history(target)
+    if not history:
+        print(f"[{group.name}] target has no Git history: {target}")
         return
 
-    usb_sync.run_command(["git", "-C", str(target), "reset", "--hard", "HEAD~1"])
+    selected = resolve_target_revision(history, to_value)
+    if to_value is None and selected is None:
+        print(f"[{group.name}] target has no previous commit: {target}")
+        return
+    if to_value is not None and selected is None:
+        print(f"[{group.name}] target revision not found: {to_value}")
+        return
+
+    if not prompt_target_restore(group, selected):
+        print(f"[{group.name}] target restore cancelled.")
+        return
+
+    revision = selected.commit_hash if selected is not None else "HEAD~1"
+    usb_sync.run_command(["git", "-C", str(target), "reset", "--hard", revision])
     usb_sync.run_command(["git", "-C", str(target), "clean", "-fd"])
-    print(f"[{group.name}] target restored to previous commit: {target}")
+    if selected is None:
+        print(f"[{group.name}] target restored to previous commit: {target}")
+    else:
+        print(f"[{group.name}] target restored to {selected.rollback_id}: {target}")
 
 
-def restore_source(source_root: Path) -> None:
+def select_source_entries(entries: Sequence[SourceBackupEntry], to_value: Optional[str]) -> List[SourceBackupEntry]:
+    if to_value is None:
+        latest = latest_source_backups(entries)
+        return list(latest.values())
+
+    normalized = to_value.strip()
+    selected = [
+        entry
+        for entry in entries
+        if normalized in {entry.rollback_id, entry.backup_file.name, entry.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")}
+    ]
+    return selected
+
+
+def restore_source(source_root: Path, to_value: Optional[str]) -> None:
     backup_root = source_backup_root(source_root)
     if not backup_root.exists():
         print(f"source has no backup directory: {source_root}")
@@ -327,8 +460,12 @@ def restore_source(source_root: Path) -> None:
         print(f"source has no backup files: {source_root}")
         return
 
-    latest = latest_source_backups(entries)
-    for entry in latest.values():
+    selected = select_source_entries(entries, to_value)
+    if not selected:
+        print(f"source revision not found: {to_value}")
+        return
+
+    for entry in selected:
         destination = source_root / entry.original_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(entry.backup_file, destination)
@@ -336,23 +473,31 @@ def restore_source(source_root: Path) -> None:
 
 
 def restore_backups(settings: usb_sync.Settings, args: argparse.Namespace) -> None:
-    groups = select_groups(settings, args.group)
-    endpoint_mode = selected_endpoint_mode(args)
+    groups = select_groups(settings, args.scope)
 
     for group in groups:
-        print_group_header(group)
-        if endpoint_mode in {"both", "targets"}:
-            restore_target(group)
-        if endpoint_mode in {"both", "sources"}:
-            sources = select_sources(group, settings.config_path, args.source)
-            for source_root in sources:
-                restore_source(source_root)
+        try:
+            scope = resolve_group_scope(group, args.scope)
+            print_group_header(group)
+            if scope.include_target:
+                restore_target(group, args.to)
+            for source_root in scope.source_roots:
+                restore_source(source_root, args.to)
+        except ValueError as exc:
+            print(str(exc))
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     settings = load_settings(resolve_config_path(args.config))
+
+    if args.scope:
+        selector_sections = {selector.section_name for selector in (parse_scope_selector(scope) for scope in args.scope) if selector.section_name is not None}
+        known_sections = {group.name for group in settings.groups}
+        missing_sections = sorted(section for section in selector_sections if section not in known_sections)
+        if missing_sections:
+            raise ValueError(f"Unknown sync section(s): {', '.join(missing_sections)}")
 
     if args.command == "list":
         list_backups(settings, args)
