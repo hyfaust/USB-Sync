@@ -33,6 +33,7 @@ class SourceBackupEntry:
     rollback_id: str
     timestamp: datetime
     size: int
+    batch_id: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class TargetCommitEntry:
     short_hash: str
     timestamp_text: str
     subject: str
+    batch_id: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         default=None,
         help="Path to config.ini. Defaults to config.ini next to the script.",
+    )
+    # Non-interactive confirmation flag: must be provided to perform destructive target resets.
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm destructive actions (perform target resets without interactive prompts).",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -256,6 +264,9 @@ def gather_source_backups(group: usb_sync.SyncGroup, source_root: Path) -> List[
             continue
         timestamp = datetime.strptime(match.group("ts"), "%Y%m%dT%H%M%S%f")
         original_rel = backup_file.relative_to(backup_root).with_name(match.group("stem"))
+        # Extract batch_id from the backup path: backups are stored under backup_root/<batch_id>/...
+        rel_parts = backup_file.relative_to(backup_root).parts
+        batch_id = rel_parts[0] if len(rel_parts) > 1 else None
         entries.append(
             SourceBackupEntry(
                 group_name=group.name,
@@ -266,6 +277,7 @@ def gather_source_backups(group: usb_sync.SyncGroup, source_root: Path) -> List[
                 rollback_id=format_backup_rollback_id(timestamp),
                 timestamp=timestamp,
                 size=backup_file.stat().st_size,
+                batch_id=batch_id,
             )
         )
 
@@ -310,6 +322,10 @@ def list_target_history(target_root: Path) -> List[TargetCommitEntry]:
         if len(parts) != 4:
             continue
         timestamp = datetime.strptime(parts[2], "%Y-%m-%d %H:%M:%S")
+        # Attempt to extract sync batch id from commit subject if present (usb_sync includes it in messages)
+        subject = parts[3]
+        m = re.match(r"^sync(?:\s+init)?\s+(?P<batch>[^\s]+)", subject)
+        batch_id = m.group("batch") if m else None
         entries.append(
             TargetCommitEntry(
                 target_root=target_root,
@@ -318,31 +334,52 @@ def list_target_history(target_root: Path) -> List[TargetCommitEntry]:
                 commit_hash=parts[0],
                 short_hash=parts[1],
                 timestamp_text=parts[2],
-                subject=parts[3],
+                subject=subject,
+                batch_id=batch_id,
             )
         )
     return entries
 
 
+# ANSI color helpers
+CSI = "\033["
+RESET = CSI + "0m"
+BOLD = CSI + "1m"
+YELLOW = CSI + "33m"
+GREEN = CSI + "32m"
+MAGENTA = CSI + "35m"
+CYAN = CSI + "36m"
+
+
+def color(text: str, code: str) -> str:
+    return f"{code}{text}{RESET}"
+
+
 def print_group_header(group: usb_sync.SyncGroup) -> None:
-    print(f"[{group.name}]")
-    print(f"  target: {group.target}")
+    print(color(f"[{group.name}]", BOLD + CYAN))
+    print(f"  target: {color(str(group.target), BOLD)}")
 
 
-def print_target_list(group: usb_sync.SyncGroup, detailed: bool) -> None:
-    history = list_target_history(group.target)
+def print_target_list(group: usb_sync.SyncGroup, detailed: bool, history: Optional[List[TargetCommitEntry]] = None) -> None:
+    if history is None:
+        history = list_target_history(group.target)
     print("  target commits:")
     if not history:
         print("    (none)")
         return
     for entry in history:
+        rb = color(entry.rollback_id, YELLOW)
+        sh = color(entry.short_hash, GREEN)
+        subj = color(entry.subject, BOLD)
+        batch_part = f" | {color(entry.batch_id, MAGENTA)}" if entry.batch_id else ""
         if detailed:
-            print(f"    {entry.rollback_id} | {entry.timestamp_text} | {entry.short_hash} | {entry.commit_hash} | {entry.subject}")
+            ts = color(entry.timestamp_text, CYAN)
+            print(f"    {rb} | {ts} | {sh} | {entry.commit_hash} | {subj}{batch_part}")
         else:
-            print(f"    {entry.rollback_id} | {entry.short_hash} | {entry.subject}")
+            print(f"    {rb} | {sh} | {subj}{batch_part}")
 
 
-def print_source_list(group: usb_sync.SyncGroup, source_root: Path) -> None:
+def print_source_list(group: usb_sync.SyncGroup, source_root: Path, commit_by_batch: Optional[Dict[str, TargetCommitEntry]] = None) -> None:
     entries = gather_source_backups(group, source_root)
     print(f"  source: {source_root}")
     print(f"    backup root: {source_backup_root(source_root)}")
@@ -351,10 +388,16 @@ def print_source_list(group: usb_sync.SyncGroup, source_root: Path) -> None:
         return
     latest = latest_source_backups(entries)
     for entry in entries:
-        marker = "*" if latest.get(entry.original_path.as_posix()) == entry else " "
+        marker = color("*", GREEN) if latest.get(entry.original_path.as_posix()) == entry else " "
+        rb = color(entry.rollback_id, YELLOW)
+        ts = color(entry.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f'), CYAN)
+        batch_part = f" | {color(entry.batch_id, MAGENTA)}" if entry.batch_id else ""
+        match_part = ""
+        if commit_by_batch and entry.batch_id and entry.batch_id in commit_by_batch:
+            match_entry = commit_by_batch[entry.batch_id]
+            match_part = f" -> target {color(match_entry.short_hash, GREEN)}"
         print(
-            f"    {marker} {entry.rollback_id} | {entry.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')} | "
-            f"{entry.original_path.as_posix()} | {entry.backup_file.name}"
+            f"    {marker} {rb} | {ts} | {entry.original_path.as_posix()} | {entry.backup_file.name}{batch_part}{match_part}"
         )
 
 
@@ -364,10 +407,15 @@ def list_backups(settings: usb_sync.Settings, args: argparse.Namespace) -> None:
         try:
             scope = resolve_group_scope(group, args.scope)
             print_group_header(group)
+            history = None
+            commit_by_batch: Dict[str, TargetCommitEntry] = {}
             if scope.include_target:
-                print_target_list(group, detailed=not scope.has_source_selector)
+                history = list_target_history(group.target)
+                if history:
+                    commit_by_batch = {entry.batch_id: entry for entry in history if entry.batch_id}
+                print_target_list(group, detailed=not scope.has_source_selector, history=history)
             for source_root in scope.source_roots:
-                print_source_list(group, source_root)
+                print_source_list(group, source_root, commit_by_batch=commit_by_batch)
         except ValueError as exc:
             print(str(exc))
 
@@ -383,25 +431,25 @@ def resolve_target_revision(history: Sequence[TargetCommitEntry], to_value: Opti
     for entry in history:
         if normalized in {entry.rollback_id, entry.commit_hash, entry.short_hash, entry.timestamp_text}:
             return entry
+        if entry.batch_id and normalized == entry.batch_id:
+            return entry
+        if normalized in entry.subject:
+            return entry
         if entry.commit_hash.startswith(normalized):
             return entry
     return None
 
 
 def prompt_target_restore(group: usb_sync.SyncGroup, entry: Optional[TargetCommitEntry]) -> bool:
-    if sys.stdin is not None and not sys.stdin.isatty():
-        raise RuntimeError(f"Target restore for [{group.name}] requires an interactive terminal.")
+    """Deprecated: interactive prompts removed. Function retained for compatibility and always returns False.
 
-    if entry is None:
-        prompt = f"[{group.name}] reset target to the previous commit? [y/N]: "
-    else:
-        prompt = f"[{group.name}] reset target to {entry.rollback_id} ({entry.short_hash} | {entry.subject})? [y/N]: "
-
-    response = input(prompt).strip().lower()
-    return response in {"y", "yes"}
+    Caller must use --yes to confirm destructive actions.
+    """
+    # interactive behavior removed to avoid pauses; require --yes from caller
+    raise RuntimeError("Interactive prompts are disabled. Use --yes to perform target restores non-interactively.")
 
 
-def restore_target(group: usb_sync.SyncGroup, to_value: Optional[str]) -> None:
+def restore_target(group: usb_sync.SyncGroup, to_value: Optional[str], require_prompt: bool = True) -> None:
     target = group.target
     usb_sync.ensure_git_safe_directory(target)
     if not (target / ".git").exists():
@@ -421,9 +469,10 @@ def restore_target(group: usb_sync.SyncGroup, to_value: Optional[str]) -> None:
         print(f"[{group.name}] target revision not found: {to_value}")
         return
 
-    if not prompt_target_restore(group, selected):
-        print(f"[{group.name}] target restore cancelled.")
-        return
+    if require_prompt:
+        if not prompt_target_restore(group, selected):
+            print(f"[{group.name}] target restore cancelled.")
+            return
 
     revision = selected.commit_hash if selected is not None else "HEAD~1"
     usb_sync.run_command(["git", "-C", str(target), "reset", "--hard", revision])
@@ -443,7 +492,7 @@ def select_source_entries(entries: Sequence[SourceBackupEntry], to_value: Option
     selected = [
         entry
         for entry in entries
-        if normalized in {entry.rollback_id, entry.backup_file.name, entry.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")}
+        if normalized in {entry.rollback_id, entry.backup_file.name, entry.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f"), entry.batch_id}
     ]
     return selected
 
@@ -475,12 +524,36 @@ def restore_source(source_root: Path, to_value: Optional[str]) -> None:
 def restore_backups(settings: usb_sync.Settings, args: argparse.Namespace) -> None:
     groups = select_groups(settings, args.scope)
 
+    # Resolve scopes first so that errors are reported before any destructive action
+    resolved: List[Tuple[usb_sync.SyncGroup, GroupScope]] = []
     for group in groups:
         try:
             scope = resolve_group_scope(group, args.scope)
+            resolved.append((group, scope))
+        except ValueError as exc:
+            print(str(exc))
+
+    # Collect groups that include target restore
+    target_groups = [group for group, scope in resolved if scope.include_target]
+
+    # If there are any targets to restore, require --yes to proceed (no interactive prompts)
+    if target_groups:
+        if not getattr(args, 'yes', False):
+            print(f"Skipping target restores for {len(target_groups)} section(s). Re-run with --yes to perform destructive target resets.")
+            global_confirm = False
+        else:
+            global_confirm = True
+    else:
+        global_confirm = False
+
+    for group, scope in resolved:
+        try:
             print_group_header(group)
             if scope.include_target:
-                restore_target(group, args.to)
+                if global_confirm:
+                    restore_target(group, args.to, require_prompt=False)
+                else:
+                    print(f"Skipping target restore for [{group.name}]. Re-run with --yes to perform.")
             for source_root in scope.source_roots:
                 restore_source(source_root, args.to)
         except ValueError as exc:

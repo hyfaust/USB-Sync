@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -137,6 +138,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prefer target, target.1, source.N, or a section-scoped selector like docs.source.1.",
     )
     return parser
+
+
+def generate_sync_batch_id() -> str:
+    return f"{datetime.now().strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex[:8]}"
 
 
 def parse_prefer_selector(raw: Optional[str]) -> Optional[PreferSelector]:
@@ -608,6 +613,7 @@ def backup_timestamp() -> str:
 def backup_existing_file(
     destination: Path,
     backup_root: Path,
+    sync_batch_id: str,
     relative_path: Path,
     backup_limit: Optional[int],
 ) -> Optional[Path]:
@@ -618,7 +624,7 @@ def backup_existing_file(
         return None
 
     timestamp = backup_timestamp()
-    backup_path = backup_root / relative_path.parent / f"{relative_path.name}.{timestamp}.bak"
+    backup_path = backup_root / sync_batch_id / relative_path.parent / f"{relative_path.name}.{timestamp}.bak"
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(destination, backup_path)
     prune_backups(backup_path.parent, relative_path.name, backup_limit)
@@ -651,6 +657,7 @@ def prune_backups(backup_dir: Path, file_name: str, backup_limit: Optional[int])
 def delete_file_with_backup(
     destination: Path,
     backup_root: Path,
+    sync_batch_id: str,
     relative_path: Path,
     backup_limit: Optional[int],
 ) -> Optional[Path]:
@@ -660,7 +667,7 @@ def delete_file_with_backup(
     if not destination.exists():
         return None
 
-    backup_path = backup_root / relative_path.parent / f"{relative_path.name}.{backup_timestamp()}.bak"
+    backup_path = backup_root / sync_batch_id / relative_path.parent / f"{relative_path.name}.{backup_timestamp()}.bak"
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(destination, backup_path)
     destination.unlink()
@@ -787,6 +794,7 @@ def synchronize(
     git_state: TargetGitState,
     source_backup_enabled: bool,
     prefer_selector: Optional[PreferSelector],
+    sync_batch_id: str,
 ) -> SyncOutcome:
     if not group.target.exists():
         group.target.mkdir(parents=True, exist_ok=True)
@@ -869,7 +877,7 @@ def synchronize(
 
                 logging.info("Syncing %s -> %s", winner.full_path, destination_path)
                 if index != target_index and source_backup_enabled:
-                    backup_existing_file(destination_path, endpoint.backup_root, path, group.backup_limit)
+                    backup_existing_file(destination_path, endpoint.backup_root, sync_batch_id, path, group.backup_limit)
                 copy_file(winner.full_path, destination_path)
 
                 inventories[index][key] = FileRecord(
@@ -919,7 +927,7 @@ def synchronize(
 
                 logging.info("Syncing %s -> %s", winner.full_path, destination_path)
                 if index != target_index and source_backup_enabled:
-                    backup_existing_file(destination_path, endpoint.backup_root, path, group.backup_limit)
+                    backup_existing_file(destination_path, endpoint.backup_root, sync_batch_id, path, group.backup_limit)
                 copy_file(winner.full_path, destination_path)
                 inventories[index][key] = FileRecord(
                     endpoint_index=index,
@@ -943,6 +951,7 @@ def synchronize(
                     delete_file_with_backup(
                         source_record.full_path,
                         source_endpoint.backup_root,
+                        sync_batch_id,
                         path,
                         group.backup_limit,
                     )
@@ -998,6 +1007,7 @@ def git_commit_if_needed(
     changed_paths: List[Path],
     changes: List[SyncChange],
     has_commits_before_sync: bool,
+    sync_batch_id: str,
 ) -> CommitResult:
     ensure_git_repo(target)
     ensure_git_safe_directory(target)
@@ -1044,7 +1054,11 @@ def git_commit_if_needed(
         return CommitResult(committed=False, message=None, initial_commit=False)
 
     initial_commit = not has_commits_before_sync
-    message = "sync init" if initial_commit else summarize_changes(changes)
+    if initial_commit:
+        message = f"sync init {sync_batch_id}"
+    else:
+        message_summary = summarize_changes(changes)
+        message = f"sync {sync_batch_id} - {message_summary}"
     logging.info("Committing with message: %s", message)
     commit = run_command(["git", "commit", "-m", message], cwd=target, check=False)
     if commit.returncode != 0:
@@ -1096,6 +1110,7 @@ def run_group(
     group: SyncGroup,
     source_backup_enabled: bool,
     prefer_selector: Optional[PreferSelector],
+    sync_batch_id: str,
 ) -> Tuple[SyncOutcome, CommitResult]:
     log_file = log_file_for_group(group)
     setup_logging(log_file, group.log_max_bytes)
@@ -1106,12 +1121,13 @@ def run_group(
     logging.info("Target: %s", group.target)
 
     git_state = get_git_state(group.target)
-    outcome = synchronize(group, git_state, source_backup_enabled, prefer_selector)
+    outcome = synchronize(group, git_state, source_backup_enabled, prefer_selector, sync_batch_id)
     commit_result = git_commit_if_needed(
         group.target,
         outcome.target_paths,
         outcome.changes,
         git_state.has_commits,
+        sync_batch_id,
     )
     logging.info("Sync complete.")
     return outcome, commit_result
@@ -1132,9 +1148,10 @@ def main() -> int:
 
     group_summaries: List[str] = []
     total_changes = {"added": 0, "modified": 0, "deleted": 0}
+    sync_batch_id = generate_sync_batch_id()
     for group in settings.groups:
         try:
-            outcome, commit_result = run_group(group, source_backup_enabled, prefer_selector)
+            outcome, commit_result = run_group(group, source_backup_enabled, prefer_selector, sync_batch_id)
         except PreferResolutionError as exc:
             logging.error("%s", exc)
             continue
